@@ -96,7 +96,7 @@ pip install -r requirements.txt
 | `REGION` | No | Overrides the region from the OCI config file |
 | `INCLUDE_SUBCOMPARTMENTS` | No | `true`/`false` (default: `true`) |
 | `BOT_TOKEN` | Yes (for alerts) | Telegram bot token |
-| `UID` | Yes (for alerts) | Telegram chat ID to send the report to |
+| `Chat_UID` | Yes (for alerts) | Telegram chat ID to send the report to |
 | `DEFAULT_MAX_MBITS` | No | Max bandwidth in Mbps used for network % calc (default: `50`) |
 | `MAX_MBITS_<SHAPE>` | No | Per-shape override, e.g. `MAX_MBITS_VM_STANDARD_A1_FLEX=1000` |
 
