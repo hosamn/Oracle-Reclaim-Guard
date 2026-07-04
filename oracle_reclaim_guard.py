@@ -79,6 +79,12 @@ def telegram_send(bot_token, chat_id, text):
 
     response.raise_for_status()
 
+def safe_telegram_send(bot_token, chat_id, text):
+    try:
+        telegram_send(bot_token, chat_id, text)
+    except Exception as e:
+        print(f"Telegram delivery failed: {e}")
+
 def load_config():
     profile = os.getenv("OCI_CONFIG_PROFILE", "DEFAULT")
     region = os.getenv("REGION")
@@ -90,21 +96,49 @@ def load_config():
 
     return config
 
-def list_running_instances(compute_client, compartment_id, include_subcompartments):
-    kwargs = {
-        "compartment_id": compartment_id,
-        "lifecycle_state": "RUNNING",
-    }
+def list_all_compartments(identity_client, root_compartment_id):
+    """Recursively collect every active descendant compartment OCID under
+    root_compartment_id. Works at any level of the hierarchy (not just the
+    tenancy root), unlike list_compartments' compartment_id_in_subtree flag,
+    which only applies when called on the root compartment."""
+    all_ids = []
+    to_visit = [root_compartment_id]
+
+    while to_visit:
+        current = to_visit.pop()
+
+        response = oci.pagination.list_call_get_all_results(
+            identity_client.list_compartments,
+            compartment_id=current,
+            lifecycle_state="ACTIVE",
+        )
+
+        children = response.data or []
+
+        for child in children:
+            all_ids.append(child.id)
+            to_visit.append(child.id)
+
+    return all_ids
+
+def list_running_instances(compute_client, identity_client, compartment_id, include_subcompartments):
+    compartment_ids = [compartment_id]
 
     if include_subcompartments:
-        kwargs["compartment_id_in_subtree"] = True
+        compartment_ids.extend(list_all_compartments(identity_client, compartment_id))
 
-    response = oci.pagination.list_call_get_all_results(
-        compute_client.list_instances,
-        **kwargs,
-    )
+    all_instances = []
 
-    return response.data or []
+    for cid in compartment_ids:
+        response = oci.pagination.list_call_get_all_results(
+            compute_client.list_instances,
+            compartment_id=cid,
+            lifecycle_state="RUNNING",
+        )
+
+        all_instances.extend(response.data or [])
+
+    return all_instances
 
 def get_primary_vnic_id(compute_client, instance):
     response = oci.pagination.list_call_get_all_results(
@@ -279,6 +313,12 @@ def check_instance(monitoring_client, instance, vnic_id):
     # Oracle-style AND logic
     at_risk = cpu_idle and network_idle and memory_idle
 
+    data_incomplete = (
+        cpu_p95 is None
+        or (memory_checked and memory_mean is None)
+        or network_util_p95 is None
+    )
+
     return {
         "name": instance_name,
         "id": instance_id,
@@ -293,11 +333,13 @@ def check_instance(monitoring_client, instance, vnic_id):
         "network_util_p95": network_util_p95,
         "network_idle": network_idle,
         "at_risk": at_risk,
+        "data_incomplete": data_incomplete,
     }
 
 def build_report(results):
     risky = [r for r in results if r["at_risk"]]
     safe = [r for r in results if not r["at_risk"]]
+    incomplete = [r for r in results if r.get("data_incomplete")]
 
     lines = []
     lines.append("Oracle Reclaim Guard")
@@ -305,6 +347,8 @@ def build_report(results):
     lines.append(f"Instances checked: {len(results)}")
     lines.append(f"Safe: {len(safe)}")
     lines.append(f"At risk: {len(risky)}")
+    if incomplete:
+        lines.append(f"Incomplete data: {len(incomplete)} (see NO DATA entries below)")
     lines.append("")
 
     for r in results:
@@ -312,20 +356,26 @@ def build_report(results):
 
         lines.append(f"{status} — {r['name']}")
         lines.append(f"Shape: {r['shape']}")
-        lines.append(f"CPU P95: {fmt_pct(r['cpu_p95'])} — {'IDLE' if r['cpu_idle'] else 'OK'}")
+
+        cpu_label = "NO DATA" if r["cpu_p95"] is None else ("IDLE" if r["cpu_idle"] else "OK")
+        lines.append(f"CPU P95: {fmt_pct(r['cpu_p95'])} — {cpu_label}")
 
         if r["memory_checked"]:
-            lines.append(
-                f"Memory mean: {fmt_pct(r['memory_mean'])} — "
-                f"{'IDLE' if r['memory_idle'] else 'OK'}"
+            memory_label = (
+                "NO DATA" if r["memory_mean"] is None
+                else ("IDLE" if r["memory_idle"] else "OK")
             )
+            lines.append(f"Memory mean: {fmt_pct(r['memory_mean'])} — {memory_label}")
         else:
             lines.append("Memory: skipped, not A1")
 
+        network_label = (
+            "NO DATA" if r["network_util_p95"] is None
+            else ("IDLE" if r["network_idle"] else "OK")
+        )
         lines.append(
             f"Network P95: {fmt_pct(r['network_util_p95'])} "
-            f"of {r['max_mbits']:.0f} Mbps — "
-            f"{'IDLE' if r['network_idle'] else 'OK'}"
+            f"of {r['max_mbits']:.0f} Mbps — {network_label}"
         )
 
         lines.append("")
@@ -344,21 +394,33 @@ def main():
     if not compartment_id:
         raise SystemExit("Missing COMPARTMENT_ID in .env")
 
-    config = load_config()
+    try:
+        config = load_config()
 
-    compute_client = oci.core.ComputeClient(config)
-    monitoring_client = oci.monitoring.MonitoringClient(config)
+        compute_client = oci.core.ComputeClient(config)
+        monitoring_client = oci.monitoring.MonitoringClient(config)
+        identity_client = oci.identity.IdentityClient(config)
 
-    instances = list_running_instances(
-        compute_client=compute_client,
-        compartment_id=compartment_id,
-        include_subcompartments=include_subcompartments,
-    )
+        instances = list_running_instances(
+            compute_client=compute_client,
+            identity_client=identity_client,
+            compartment_id=compartment_id,
+            include_subcompartments=include_subcompartments,
+        )
+    except Exception as e:
+        report = (
+            "Oracle Reclaim Guard\n"
+            "FAILED to complete the check (setup/listing error).\n"
+            f"Error: {e}"
+        )
+        print(report)
+        safe_telegram_send(bot_token, uid, report)
+        raise SystemExit(1)
 
     if not instances:
         report = "Oracle Reclaim Guard\nNo running instances found."
         print(report)
-        telegram_send(bot_token, uid, report)
+        safe_telegram_send(bot_token, uid, report)
         return
 
     results = []
@@ -390,6 +452,7 @@ def main():
                 "network_util_p95": None,
                 "network_idle": False,
                 "at_risk": False,
+                "data_incomplete": True,
                 "error": str(e),
             })
 
@@ -402,7 +465,7 @@ def main():
             report += f"\n- {r['name']}: {r['error']}"
 
     print(report)
-    telegram_send(bot_token, uid, report)
+    safe_telegram_send(bot_token, uid, report)
 
     if any(r["at_risk"] for r in results):
         raise SystemExit(2)

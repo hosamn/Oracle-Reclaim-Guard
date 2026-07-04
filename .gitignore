@@ -1,0 +1,32 @@
+# OCI config, in case a local copy ever ends up in the repo
+.oci/
+config
+*.pem
+
+# Logs (matches the Cron redirect target)
+*.log
+
+# Environment / secrets
+.env
+*.env
+!.env.example
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
